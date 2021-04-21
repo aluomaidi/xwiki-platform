@@ -14,7 +14,7 @@ public class SSOUser implements Serializable
     public SSOUser() {
     }
 
-    public SSOUser(com.ifly.qxb.uap.client.entity.SSOUser ssoUser) {
+    public SSOUser(SSOUser ssoUser) {
         this.userId = ssoUser.getUserId();
         this.accountName = ssoUser.getAccountName();
         this.name = ssoUser.getName();
