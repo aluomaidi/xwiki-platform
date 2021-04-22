@@ -1,4 +1,4 @@
-package com.xpn.xwiki.user.impl.xwiki;
+package com.xpn.xwiki.sso;
 
 import java.io.Serializable;
 

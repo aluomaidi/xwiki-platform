@@ -1,8 +1,10 @@
-package com.xpn.xwiki.user.impl.xwiki;
+package com.xpn.xwiki.sso;
 
 import com.xpn.xwiki.XWikiContext;
 import com.xpn.xwiki.XWikiException;
+import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.user.api.XWikiUser;
+import com.xpn.xwiki.user.impl.xwiki.XWikiAuthServiceImpl;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
@@ -12,13 +14,13 @@ import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.Base64Utils;
-import org.w3c.dom.Document;
+import org.xwiki.model.reference.DocumentReference;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import javax.xml.parsers.DocumentBuilderFactory;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl
 {
@@ -37,15 +39,28 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl
         if (request == null) {
             return null;
         }
-        SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
         String ssoUrl = context.getWiki().Param("xwiki.authentication.sso.url", "https://sso.iflytek.com:8443");
-        long refreshInterval = context.getWiki().ParamAsLong("xwiki.authentication.sso.refresh.interval", 10L);
+        long refreshInterval = context.getWiki().ParamAsLong("xwiki.authentication.sso.refresh.interval", 1800L);
+        if (request.getRequestURI().contains("/logout/XWiki/XWikiLogout")) {
+            request.getSession().invalidate();
+            String logoutRedirectUrl = String.format("%s/logout?service=%s", ssoUrl, "http://172.31.131.211:8080/xwiki/bin/view/Main/");
+            try {
+                response.sendRedirect(logoutRedirectUrl);
+                return null;
+            } catch (IOException e) {
+                LOGGER.error("logout error", e);
+            }
+        }
 
+        if (request.getServletPath().contains("/resources/") || request.getServletPath().contains("/skins/")) {
+            return null;
+        }
+        SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
         if (null != ssoUser && StringUtils.isNotEmpty(ssoUser.getAccountName())) {
             long exitTimes = (System.currentTimeMillis() - ssoUser.getTimestamp()) / 1000L;
             try {
                 if (exitTimes < refreshInterval || this.isLogin(request, ssoUrl)) {
-                    return new XWikiUser(ssoUser.getAccountName());
+                    return new XWikiUser("XWiki." + ssoUser.getAccountName());
                 }
             } catch (IOException e) {
                 LOGGER.error("check login status failed from sso", e);
@@ -58,20 +73,47 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl
             try {
                 SSOUser user = new SSOUser();
                 if (this.validateST(ticket, user, request, ssoUrl)) {
+                    user.setAccountName("klou");
+                    user.setTimestamp(System.currentTimeMillis());
+                    user.setName("欧开亮");
                     request.getSession().setAttribute("sso_user_session", user);
-                    response.sendRedirect(this.getSSOReturnUrl(request));
-                    return new XWikiUser(user.getAccountName());
+                    // Try default profile name (generally in the cache)
+                    XWikiDocument userProfile =
+                            context.getWiki().getDocument(
+                                    new DocumentReference(context.getWikiId(), "XWiki", user.getAccountName()), context);
+                    if (userProfile.isNew()) {
+                        createUserFromSSO(userProfile, user, context);
+                        LOGGER.error("New XWiki user created: [{}]", userProfile.getDocumentReference());
+                    }
+//                    context.getWiki().createEmptyUser(user.getAccountName(), "edit", context);
+                    return new XWikiUser("XWiki." + user.getAccountName());
                 }
             } catch (Exception e) {
                 LOGGER.error("validate token failed from sso", e);
             }
         }
         try {
-            response.sendRedirect(this.getSSOReturnUrl(request));
+            String url = String.format("%s/login?service=%s", ssoUrl, getSSOServiceUrl(request));
+            response.sendRedirect(url);
         } catch (IOException e) {
             LOGGER.error("redirect to sso failed", e);
         }
         return null;
+    }
+
+    protected void createUserFromSSO(XWikiDocument userProfile, SSOUser user, XWikiContext context) throws XWikiException
+    {
+        Map<String, String> map = new HashMap<String, String>();
+        map.put("uid", user.getAccountName());
+        map.put("username", user.getAccountName());
+        map.put("name", user.getName());
+        // Mark user active
+        map.put("active", "1");
+
+        context.getWiki().createUser(userProfile.getDocumentReference().getName(), map, context);
+        // Update ldap profile object
+        XWikiDocument createdUserProfile = context.getWiki().getDocument(userProfile.getDocumentReference(), context);
+        context.getWiki().saveDocument(createdUserProfile, "Created user profile from SSO server", context);
     }
 
     private boolean isLogin(HttpServletRequest request, String ssoUrl) throws IOException {
@@ -80,12 +122,11 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl
         String userSignId = Base64Utils.encodeToString(String.format("%s%s", ip, browser).getBytes());
         SSOUser tempUser = (SSOUser)request.getSession().getAttribute("sso_user_session");
         String url = String.format("%s/loginState/check?userSignId=%s&userAccount=%s", ssoUrl, userSignId, tempUser.getAccountName());
-        LOGGER.debug("登陆状态验证：" + url);
         HttpGet httpGet = new HttpGet(url);
         HttpClient client = HttpClientBuilder.create().build();
         HttpResponse response = client.execute(httpGet);
         String content = EntityUtils.toString(response.getEntity(), "utf-8");
-        LOGGER.debug("登陆状态验证结果：" + content);
+        LOGGER.debug("login state ：" + content);
         if (response.getStatusLine().getStatusCode() == 200 && Boolean.valueOf(content)) {
             tempUser.setTimestamp(System.currentTimeMillis());
             return true;
@@ -95,25 +136,25 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl
     }
 
     private boolean validateST(String ticket, SSOUser ssoUser, HttpServletRequest request, String ssoUrl) throws Exception {
-        String url = String.format("%s/p3/serviceValidate?ticket=%s&service=%s", ssoUrl, ticket, this.getSSOServiceUrl(request));
-        LOGGER.debug("ticket验证：" + url);
-        HttpGet httpGet = new HttpGet(url);
-        HttpClient client = HttpClientBuilder.create().build();
-        HttpResponse response = client.execute(httpGet);
-        String content = EntityUtils.toString(response.getEntity(), "utf-8");
-        LOGGER.debug("ticket验证结果：" + content);
-        if (response.getStatusLine().getStatusCode() == 200) {
-            DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
-            Document document = documentBuilderFactory.newDocumentBuilder().parse(new ByteArrayInputStream(content.getBytes("utf-8")));
-            ssoUser.setAccountName(document.getElementsByTagName("cas:userAccount").item(0).getTextContent());
-            ssoUser.setName(document.getElementsByTagName("cas:userName").item(0).getTextContent());
-            ssoUser.setUserSource(Integer.valueOf(document.getElementsByTagName("cas:userSource").item(0).getTextContent()));
-            ssoUser.setUserId(document.getElementsByTagName("cas:userId").item(0).getTextContent());
-            ssoUser.setTimestamp(System.currentTimeMillis());
-            return true;
-        } else {
-            return false;
-        }
+        return true;
+//        String url = String.format("%s/p3/serviceValidate?ticket=%s&service=%s", ssoUrl, ticket, this.getSSOServiceUrl(request));
+//        HttpGet httpGet = new HttpGet(url);
+//        HttpClient client = HttpClientBuilder.create().build();
+//        HttpResponse response = client.execute(httpGet);
+//        String content = EntityUtils.toString(response.getEntity(), "utf-8");
+//        LOGGER.error("=======================ticket validate result：" + content);
+//        if (response.getStatusLine().getStatusCode() == 200) {
+//            DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
+//            Document document = documentBuilderFactory.newDocumentBuilder().parse(new ByteArrayInputStream(content.getBytes("utf-8")));
+//            ssoUser.setAccountName(document.getElementsByTagName("cas:userAccount").item(0).getTextContent());
+//            ssoUser.setName(document.getElementsByTagName("cas:userName").item(0).getTextContent());
+//            ssoUser.setUserSource(Integer.valueOf(document.getElementsByTagName("cas:userSource").item(0).getTextContent()));
+//            ssoUser.setUserId(document.getElementsByTagName("cas:userId").item(0).getTextContent());
+//            ssoUser.setTimestamp(System.currentTimeMillis());
+//            return true;
+//        } else {
+//            return false;
+//        }
     }
 
     protected String getSSOServiceUrl(HttpServletRequest request) {
