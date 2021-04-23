@@ -22,11 +22,23 @@ import javax.servlet.http.HttpServletResponse;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.security.Principal;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.securityfilter.filter.SecurityFilter.getContinueToURL;
+
 public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
     private static final Logger LOGGER = LoggerFactory.getLogger(XWikiSSOAUthServiceImpl.class);
+
+    /**
+     * The XWiki config property for storing the superadmin password.
+     */
+    private static final String SUPERADMIN_PASSWORD_CONFIG = "xwiki.superadminpassword";
+
+    private static final String FORM_USERNAME = "j_username";
+    private static final String FORM_PASSWORD = "j_password";
+    private static final String FORM_REMEMBERME = "j_rememberme";
 
     @Override
     public XWikiUser checkAuth(XWikiContext context) throws XWikiException {
@@ -41,7 +53,7 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
             return null;
         }
         String ssoUrl = context.getWiki().Param("xwiki.authentication.sso.url", "https://sso.iflytek.com:8443");
-        String callbackUrl = context.getWiki().Param("xwiki.authentication.sso.callback", "http://community.iflytek.com//xwiki/bin/view/Main/");
+        String callbackUrl = context.getWiki().Param("xwiki.authentication.sso.callback", "http://community.iflytek.com/xwiki/bin/view/Main/");
         long refreshInterval = context.getWiki().ParamAsLong("xwiki.authentication.sso.refresh.interval", 30L);
         String keystore = context.getWiki().Param("xwiki.authentication.sso.keystore", "sso.keystore");
         String keystorePwd = context.getWiki().Param("xwiki.authentication.sso.keystore.password", "iflytek");
@@ -52,23 +64,61 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         if (!System.getProperties().containsKey("javax.net.ssl.trustStorePassword")) {
             System.setProperty("javax.net.ssl.trustStorePassword", keystorePwd);
         }
-
+        // 默认登录url，不走sso认证
+        if (request.getRequestURI().contains("/xwiki/bin/login/XWiki/XWikiLogin")) {
+            return null;
+        }
+        // admin保留表单登录
+        if (request.getRequestURI().contains("/xwiki/bin/loginsubmit/XWiki/XWikiLogin")) {
+            String username = context.getWiki().convertUsername(request.getParameter(FORM_USERNAME), context);
+            String password = request.getParameter(FORM_PASSWORD);
+            // Check for superadmin
+            if (isSuperAdmin(username)) {
+                Principal principal = authenticateSuperAdmin(password, context);
+                if (principal != null) {
+                    SSOUser user = new SSOUser();
+                    user.setAccountName(username);
+                    user.setTimestamp(System.currentTimeMillis());
+                    request.getSession().setAttribute("sso_user_session", user);
+                    Boolean bAjax = (Boolean) context.get("ajax");
+                    if ((bAjax == null) || (!bAjax.booleanValue())) {
+                        String continueToURL = getContinueToURL(request);
+                        LOGGER.error("==========================================continueToURL: " + continueToURL);
+                        // This is the url that the user was initially accessing before being prompted for login.
+                        try {
+                            response.sendRedirect(response.encodeRedirectURL(continueToURL));
+                        } catch (IOException e) {
+                            LOGGER.error("redirect error", e);
+                        }
+                    }
+                    return new XWikiUser("XWiki." + user.getAccountName());
+                } else {
+                    return null;
+                }
+            }
+        }
+        // logout 需要区分是否admin
         if (request.getRequestURI().contains("/logout/XWiki/XWikiLogout")) {
-            request.getSession().invalidate();
-            String logoutRedirectUrl = String.format("%s/logout?service=%s", ssoUrl, callbackUrl);
             try {
-                response.sendRedirect(logoutRedirectUrl);
+                SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
+                request.getSession().invalidate();
+                if (ssoUser == null || !isSuperAdmin(ssoUser.getAccountName())) {
+                    response.sendRedirect(String.format("%s/logout?service=%s", ssoUrl, callbackUrl));
+                }
                 return null;
-            } catch (IOException e) {
+            } catch (Exception e) {
                 LOGGER.error("logout error", e);
             }
         }
-
+        // exclude resource
         if (request.getServletPath().contains("/resources/") || request.getServletPath().contains("/skins/")) {
             return null;
         }
         SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
         if (null != ssoUser && StringUtils.isNotEmpty(ssoUser.getAccountName())) {
+            if (isSuperAdmin(ssoUser.getAccountName())) {
+                return null;
+            }
             long exitTimes = (System.currentTimeMillis() - ssoUser.getTimestamp()) / 1000L;
             try {
                 if (exitTimes < refreshInterval || this.isLogin(request, ssoUrl)) {
@@ -81,7 +131,6 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         }
 
         String ticket = request.getParameter("ticket");
-        ;
         if (StringUtils.isNotEmpty(ticket)) {
             try {
                 SSOUser user = new SSOUser();
@@ -159,5 +208,22 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         } else {
             return false;
         }
+    }
+
+    private String getRequestUrl(HttpServletRequest request) {
+        String reqUrl = request.getRequestURL().toString();
+        String url;
+        if (null == request.getQueryString()) {
+            url = reqUrl;
+        } else if (request.getQueryString().contains("ticket")) {
+            if (StringUtils.isNotEmpty(request.getParameter("ssoQuery"))) {
+                url = String.format("%s?%s=%s", reqUrl, "ssoQuery", request.getParameter("ssoQuery"));
+            } else {
+                url = reqUrl;
+            }
+        } else {
+            url = String.format("%s?%s=%s", reqUrl, "ssoQuery", Base64Utils.encodeToString(request.getQueryString().getBytes()));
+        }
+        return url;
     }
 }
