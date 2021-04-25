@@ -4,6 +4,7 @@ import com.xpn.xwiki.XWikiContext;
 import com.xpn.xwiki.XWikiException;
 import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.user.api.XWikiUser;
+import com.xpn.xwiki.user.impl.xwiki.MyPersistentLoginManager;
 import com.xpn.xwiki.user.impl.xwiki.XWikiAuthServiceImpl;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.HttpResponse;
@@ -11,12 +12,14 @@ import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.util.EntityUtils;
+import org.securityfilter.filter.SecurityRequestWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.util.Base64Utils;
 import org.w3c.dom.Document;
 import org.xwiki.model.reference.DocumentReference;
 
+import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.xml.parsers.DocumentBuilderFactory;
@@ -26,19 +29,13 @@ import java.security.Principal;
 import java.util.HashMap;
 import java.util.Map;
 
-import static org.securityfilter.filter.SecurityFilter.getContinueToURL;
-
 public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
     private static final Logger LOGGER = LoggerFactory.getLogger(XWikiSSOAUthServiceImpl.class);
 
-    /**
-     * The XWiki config property for storing the superadmin password.
-     */
-    private static final String SUPERADMIN_PASSWORD_CONFIG = "xwiki.superadminpassword";
+    private MyPersistentLoginManager loginManager = new MyPersistentLoginManager();
 
     private static final String FORM_USERNAME = "j_username";
     private static final String FORM_PASSWORD = "j_password";
-    private static final String FORM_REMEMBERME = "j_rememberme";
 
     @Override
     public XWikiUser checkAuth(XWikiContext context) throws XWikiException {
@@ -64,11 +61,11 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         if (!System.getProperties().containsKey("javax.net.ssl.trustStorePassword")) {
             System.setProperty("javax.net.ssl.trustStorePassword", keystorePwd);
         }
-        // 默认登录url，不走sso认证
+        // admin登录url，不走sso认证
         if (request.getRequestURI().contains("/xwiki/bin/login/XWiki/XWikiLogin")) {
             return null;
         }
-        // admin保留表单登录
+        // admin登录
         if (request.getRequestURI().contains("/xwiki/bin/loginsubmit/XWiki/XWikiLogin")) {
             String username = context.getWiki().convertUsername(request.getParameter(FORM_USERNAME), context);
             String password = request.getParameter(FORM_PASSWORD);
@@ -76,22 +73,14 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
             if (isSuperAdmin(username)) {
                 Principal principal = authenticateSuperAdmin(password, context);
                 if (principal != null) {
-                    SSOUser user = new SSOUser();
-                    user.setAccountName(username);
-                    user.setTimestamp(System.currentTimeMillis());
-                    request.getSession().setAttribute("sso_user_session", user);
-                    Boolean bAjax = (Boolean) context.get("ajax");
-                    if ((bAjax == null) || (!bAjax.booleanValue())) {
-                        String continueToURL = getContinueToURL(request);
-                        LOGGER.error("==========================================continueToURL: " + continueToURL);
-                        // This is the url that the user was initially accessing before being prompted for login.
-                        try {
-                            response.sendRedirect(response.encodeRedirectURL(continueToURL));
-                        } catch (IOException e) {
-                            LOGGER.error("redirect error", e);
-                        }
+                    loginManager.setProtection("none");
+                    loginManager.rememberLogin(request, response, username, password);
+                    try {
+                        response.sendRedirect(callbackUrl);
+                    } catch (IOException e) {
+                        LOGGER.error("redirect error", e);
                     }
-                    return new XWikiUser("XWiki." + user.getAccountName());
+                    return null;
                 } else {
                     return null;
                 }
@@ -100,12 +89,16 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         // logout 需要区分是否admin
         if (request.getRequestURI().contains("/logout/XWiki/XWikiLogout")) {
             try {
+                String username = getCookieValue(request.getCookies(), "username", "false");
                 SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
-                request.getSession().invalidate();
-                if (ssoUser == null || !isSuperAdmin(ssoUser.getAccountName())) {
-                    response.sendRedirect(String.format("%s/logout?service=%s", ssoUrl, callbackUrl));
+                if (ssoUser != null) {
+                    username = ssoUser.getAccountName();
                 }
-                return null;
+                request.getSession().invalidate();
+                SecurityRequestWrapper securityRequestWrapper = new SecurityRequestWrapper(request, null, null, null);
+                loginManager.forgetLogin(securityRequestWrapper, response);
+                response.sendRedirect(String.format("%s/logout?service=%s", ssoUrl, callbackUrl));
+                return new XWikiUser("XWiki." + username);
             } catch (Exception e) {
                 LOGGER.error("logout error", e);
             }
@@ -114,6 +107,7 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         if (request.getServletPath().contains("/resources/") || request.getServletPath().contains("/skins/")) {
             return null;
         }
+        // 普通用户session认证
         SSOUser ssoUser = (SSOUser) request.getSession().getAttribute("sso_user_session");
         if (null != ssoUser && StringUtils.isNotEmpty(ssoUser.getAccountName())) {
             if (isSuperAdmin(ssoUser.getAccountName())) {
@@ -129,12 +123,22 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
                 return null;
             }
         }
+        // 管理员cookie认证
+        loginManager.setProtection("none");
+        String username = getCookieValue(request.getCookies(), "username", "false");
+        String password = getCookieValue(request.getCookies(), "password", "false");
+        if (StringUtils.isNotEmpty(username) && isSuperAdmin(username)) {
+            Principal principal = authenticateSuperAdmin(password, context);
+            if (principal != null) {
+                return new XWikiUser(principal.getName());
+            }
+        }
 
         String ticket = request.getParameter("ticket");
         if (StringUtils.isNotEmpty(ticket)) {
             try {
                 SSOUser user = new SSOUser();
-                if (this.validateST(ticket, user, ssoUrl, callbackUrl)) {
+                if (this.validateST(ticket, user, ssoUrl, getRequestUrl(request))) {
                     request.getSession().setAttribute("sso_user_session", user);
                     XWikiDocument userProfile =
                             context.getWiki().getDocument(
@@ -150,7 +154,7 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
             }
         }
         try {
-            String url = String.format("%s/login?service=%s", ssoUrl, callbackUrl);
+            String url = String.format("%s/login?service=%s", ssoUrl, getRequestUrl(request));
             response.sendRedirect(url);
         } catch (IOException e) {
             LOGGER.error("redirect to sso failed", e);
@@ -190,8 +194,8 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
         }
     }
 
-    private boolean validateST(String ticket, SSOUser ssoUser, String ssoUrl, String callbackUrl) throws Exception {
-        String url = String.format("%s/p3/serviceValidate?ticket=%s&service=%s", ssoUrl, ticket, callbackUrl);
+    private boolean validateST(String ticket, SSOUser ssoUser, String ssoUrl, String serviceUrl) throws Exception {
+        String url = String.format("%s/p3/serviceValidate?ticket=%s&service=%s", ssoUrl, ticket, serviceUrl);
         HttpGet httpGet = new HttpGet(url);
         HttpClient client = HttpClientBuilder.create().build();
         HttpResponse response = client.execute(httpGet);
@@ -225,5 +229,17 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
             url = String.format("%s?%s=%s", reqUrl, "ssoQuery", Base64Utils.encodeToString(request.getQueryString().getBytes()));
         }
         return url;
+    }
+
+    private String getCookieValue(Cookie[] cookies, String cookieName, String defaultValue) {
+        String value = defaultValue;
+        if (cookies != null) {
+            for (Cookie cookie : cookies) {
+                if (cookieName.equals(cookie.getName())) {
+                    value = cookie.getValue();
+                }
+            }
+        }
+        return value;
     }
 }
