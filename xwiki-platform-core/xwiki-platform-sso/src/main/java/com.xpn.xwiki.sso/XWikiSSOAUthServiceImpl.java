@@ -26,16 +26,21 @@ import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.security.Principal;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
     private static final Logger LOGGER = LoggerFactory.getLogger(XWikiSSOAUthServiceImpl.class);
 
-    private MyPersistentLoginManager loginManager = new MyPersistentLoginManager();
+    private final MyPersistentLoginManager loginManager = new MyPersistentLoginManager();
 
     private static final String FORM_USERNAME = "j_username";
     private static final String FORM_PASSWORD = "j_password";
+
+    private static final Map<String, String> idToUrl = new HashMap<>();
+    private static final Map<String, String> ticketToRid = new HashMap<>();
 
     @Override
     public XWikiUser checkAuth(XWikiContext context) throws XWikiException {
@@ -131,14 +136,35 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
             Principal principal = authenticateSuperAdmin(password, context);
             if (principal != null) {
                 return new XWikiUser(principal.getName());
+            } else {
+                return null;
             }
         }
 
         String ticket = request.getParameter("ticket");
+        String rid = null;
+        Enumeration enu = request.getParameterNames();
+        while (enu.hasMoreElements()) {
+            String paraName = (String) enu.nextElement();
+            if (paraName.contains("rid")) {
+                rid = request.getParameter(paraName);
+            }
+        }
         if (StringUtils.isNotEmpty(ticket)) {
             try {
+                if (StringUtils.isNotEmpty(rid) && StringUtils.isNotEmpty(idToUrl.get(rid))) {
+                    String originalUrl = idToUrl.get(rid);
+                    ticketToRid.put(ticket, rid);
+                    response.sendRedirect(String.format("%s?ticket=%s", originalUrl, ticket));
+                    return null;
+                }
                 SSOUser user = new SSOUser();
-                if (this.validateST(ticket, user, ssoUrl, getRequestUrl(request))) {
+                String validateUrl = idToUrl.get(ticketToRid.get(ticket)) + "?rid=" + ticketToRid.get(ticket);
+                if (this.validateST(ticket, user, ssoUrl, validateUrl)) {
+                    if (StringUtils.isNotEmpty(ticketToRid.get(ticket))) {
+                        idToUrl.remove(ticketToRid.get(ticket));
+                    }
+                    ticketToRid.remove(ticket);
                     request.getSession().setAttribute("sso_user_session", user);
                     XWikiDocument userProfile =
                             context.getWiki().getDocument(
@@ -151,10 +177,15 @@ public class XWikiSSOAUthServiceImpl extends XWikiAuthServiceImpl {
                 }
             } catch (Exception e) {
                 LOGGER.error("validate token failed from sso", e);
+                return null;
             }
         }
         try {
-            String url = String.format("%s/login?service=%s", ssoUrl, getRequestUrl(request));
+            String reqUrl = getRequestUrl(request);
+            String orid = UUID.randomUUID().toString();
+            idToUrl.put(orid, reqUrl);
+            reqUrl += "?rid=" + orid;
+            String url = String.format("%s/login?service=%s", ssoUrl, reqUrl);
             response.sendRedirect(url);
         } catch (IOException e) {
             LOGGER.error("redirect to sso failed", e);
